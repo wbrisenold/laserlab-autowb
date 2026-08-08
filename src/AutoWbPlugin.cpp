@@ -23,10 +23,11 @@ static const int kGridW = 128, kGridH = 72;     // scan grid (bounded GPU read-b
 static const float kEps = 1e-4f;
 
 // ---- neutral WB-only params (everything else identity) ----
-static LaserLabParams spaceParams(double temp, double tint, int gamut, int transfer) {
+static LaserLabParams spaceParams(double temp, double tint, int gamut, int transfer, int showMask) {
     LaserLabParams p = {};
     p.inputGamut = gamut; p.inputTransfer = transfer;   // user selectable (colorspace-aware)
     p.temp = (float)temp; p.tint = (float)tint;
+    p.showMask = showMask;
     p.plMaster = 25.0f; p.plRed = 25.0f; p.plGreen = 25.0f; p.plBlue = 25.0f;
     p.gamma = 1.0f; p.gain = 1.0f;            // neutral primaries
     return p;
@@ -86,6 +87,7 @@ private:
     OFX::DoubleParam*    m_Temp; OFX::DoubleParam* m_Tint;
     OFX::BooleanParam*   m_LockWB;
     OFX::IntParam*       m_FrameRange;
+    OFX::BooleanParam*   m_ShowMask;
     OFX::PushButtonParam* m_AnalyzeBtn;
     OFX::StringParam*    m_Status;
     bool                 m_NeedAnalyze;
@@ -94,7 +96,6 @@ private:
     LaserLabParams scanParams(double t);
     void setSolvedWb(double temp, float tint, int n);
     void reportNoSkin();
-    void analyzeFrameRange(const OFX::RenderArguments& a, int centerFrame);
 };
 
 AutoWbPlugin::AutoWbPlugin(OfxImageEffectHandle h)
@@ -106,19 +107,22 @@ AutoWbPlugin::AutoWbPlugin(OfxImageEffectHandle h)
     m_Tint       = fetchDoubleParam("tint");
     m_LockWB     = fetchBooleanParam("lockWB");
     m_FrameRange  = fetchIntParam("frameRange");
+    m_ShowMask   = fetchBooleanParam("showMask");
     m_AnalyzeBtn  = fetchPushButtonParam("analyzeWb");
     m_Status     = fetchStringParam("wbStatusText");
 }
 
 LaserLabParams AutoWbPlugin::gatherParams(double t) {
     int g = 1, tf = 1; m_InputGamut->getValueAtTime(t, g); m_InputTransfer->getValueAtTime(t, tf);
-    return spaceParams(m_Temp->getValueAtTime(t), m_Tint->getValueAtTime(t), g, tf);
+    bool showMask = false; m_ShowMask->getValueAtTime(t, showMask);
+    return spaceParams(m_Temp->getValueAtTime(t), m_Tint->getValueAtTime(t), g, tf, showMask ? 1 : 0);
 }
 
 // Measurement params: same source colorspace, zero WB (analyze the RAW frame).
 LaserLabParams AutoWbPlugin::scanParams(double t) {
     int g = 1, tf = 1; m_InputGamut->getValueAtTime(t, g); m_InputTransfer->getValueAtTime(t, tf);
-    return spaceParams(0.0, 0.0, g, tf);
+    bool showMask = false; m_ShowMask->getValueAtTime(t, showMask);
+    return spaceParams(0.0, 0.0, g, tf, showMask ? 1 : 0);
 }
 
 void AutoWbPlugin::setSolvedWb(double temp, float tint, int n) {
@@ -301,6 +305,11 @@ void AutoWbPluginFactory::describeInContext(OFX::ImageEffectDescriptor& d, OFX::
     lb->setLabel("Lock WB");
     lb->setDefault(false);
     lb->setHint("When ON, Analyze button is disabled — current Temp/Tint hold for all frames. Analyze once, lock, done.");
+
+    OFX::BooleanParamDescriptor* sm = d.defineBooleanParam("showMask");
+    sm->setLabel("Show Mask");
+    sm->setDefault(false);
+    sm->setHint("When ON, output the skin detection mask as grayscale instead of WB result. Use to refine detection.");
 
     OFX::IntParamDescriptor* fr = d.defineIntParam("frameRange");
     fr->setLabel("Analyze ±Frames");

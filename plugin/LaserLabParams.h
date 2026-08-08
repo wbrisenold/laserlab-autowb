@@ -119,6 +119,7 @@ typedef struct LaserLabParams
     float autoWbLmsGainX;         // held CAT16 LMS gain (R)
     float autoWbLmsGainY;         // held CAT16 LMS gain (G)
     float autoWbLmsGainZ;         // held CAT16 LMS gain (B)
+    int   showMask;               // 0=WB, 1=show skin mask
 
     // ---- meta ----
     int   _pad0;
