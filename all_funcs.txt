@@ -1,0 +1,447 @@
+// awg4_ingamut
+__DEVICE__ bool awg4_ingamut(float L,float cosh,float sinh,float r){
+  float l0=L+P_C1[0]*cosh*r+P_C2[0]*sinh*r;
+  float l1=L+P_C1[1]*cosh*r+P_C2[1]*sinh*r;
+  float l2=L+P_C1[2]*cosh*r+P_C2[2]*sinh*r;
+  l0=l0*l0*l0;l1=l1*l1*l1;l2=l2*l2*l2;
+  float a0=1.8746868966f*l0-1.0494462399f*l1+0.1747593441f*l2;
+  float a1=-0.6657305832f*l0+1.7472828065f*l1-0.0815522231f*l2;
+  float a2=-0.0701275482f*l0-0.3870256867f*l1+1.4571532352f*l2;
+  return a0>=0.0f&&a1>=0.0f&&a2>=0.0f;
+}
+
+// cat16_adapt
+__DEVICE__ float3 cat16_adapt(float3 xyz,float3 src_white,float3 dst_white){
+  float3 lms=mmul(CAT16_C0,CAT16_C1,CAT16_C2,xyz);
+  float3 src=mmul(CAT16_C0,CAT16_C1,CAT16_C2,src_white);
+  float3 dst=mmul(CAT16_C0,CAT16_C1,CAT16_C2,dst_white);
+  lms=make_float3(lms.x*dst.x/src.x,lms.y*dst.y/src.y,lms.z*dst.z/src.z);
+  return mmul(CAT16I_C0,CAT16I_C1,CAT16I_C2,lms);
+}
+
+// cbrt_s
+__DEVICE__ float cbrt_s(float x){return(x<0.0f?-1.0f:1.0f)*_powf(_fabs(x),1.0f/3.0f);}
+
+// chroma
+__DEVICE__ float chroma(float3 lab){return _sqrtf(lab.y*lab.y+lab.z*lab.z);}
+
+// clampf
+__DEVICE__ float clampf(float v, float lo, float hi) { return _fmaxf(lo, _fminf(hi, v)); }
+
+// compress_oklab_chroma
+__DEVICE__ float3 compress_oklab_chroma(float3 lab,float amount){
+  if(amount<=0.0f)return lab;
+  float L=lab.x;
+  float c=_sqrtf(lab.y*lab.y+lab.z*lab.z);
+  if(c<=0.04f)return lab;                       // protect near-neutral
+  float hue=_atan2f(lab.z,lab.y);
+  float cosh=_cosf(hue),sinh=_sinf(hue);
+  // Coarse scan for the first (in->out) exit along r in [0,4], then refine the bracket.
+  float cmax=4.0f;
+  bool prev=awg4_ingamut(L,cosh,sinh,0.0f);
+  for(int i=1;i<=32;i++){
+    float r=(float)i*4.0f/32.0f;
+    bool cur=awg4_ingamut(L,cosh,sinh,r);
+    if(prev&&!cur){
+      float lo=(float)(i-1)*4.0f/32.0f,hi=r;
+      for(int it=0;it<10;it++){
+        float mid=0.5f*(lo+hi);
+        if(awg4_ingamut(L,cosh,sinh,mid))lo=mid;else hi=mid;
+      }
+      cmax=0.5f*(lo+hi);
+      break;
+    }
+    prev=cur;
+  }
+  cmax=_fmaxf(cmax,c);
+  const float guard=0.72f;
+  float g=guard*cmax;
+  if(c<=g)return lab;
+  float t=_fminf((c-g)/(cmax-g+1e-6f),1.0f);
+  float k=1.0f/(1.0f+amount*4.0f*t);
+  float comp=g+(c-g)*k;
+  float scale=_fminf(comp/c,1.0f);
+  lab.y*=scale;lab.z*=scale;
+  return lab;
+}
+
+// compress_to_gamut
+__DEVICE__ float3 compress_to_gamut(float3 rgb,float luminance){
+  if(luminance<=0.0f)return rgb;
+  float scale=1.0f;
+  float3 delta=rgb-make_float3(luminance,luminance,luminance);
+  if(rgb.x<0.0f&&delta.x<0.0f)scale=_fminf(scale,luminance/-delta.x);
+  if(rgb.y<0.0f&&delta.y<0.0f)scale=_fminf(scale,luminance/-delta.y);
+  if(rgb.z<0.0f&&delta.z<0.0f)scale=_fminf(scale,luminance/-delta.z);
+  scale=_fmaxf(_fminf(scale,1.0f),0.0f);
+  return make_float3(luminance+delta.x*scale,luminance+delta.y*scale,luminance+delta.z*scale);
+}
+
+// d60_to_d65
+__DEVICE__ float3 d60_to_d65(float3 xyz){return cat16_adapt(xyz,WHITE_D60,WHITE_D65);}
+
+// d65_to_d60
+__DEVICE__ float3 d65_to_d60(float3 xyz){return cat16_adapt(xyz,WHITE_D65,WHITE_D60);}
+
+// deg_to_rad
+__DEVICE__ float deg_to_rad(float d){return d*(2.0f*PI)/360.0f;}
+
+// ev_curves
+__DEVICE__ float3 ev_curves(float ir,tp_t p,float sm){
+  float2 hp[7],sp[7],vp[7];for(int i=0;i<7;i++){hp[i]=make_float2(p.ri[i],p.hi[i]);sp[i]=make_float2(p.ri[i],p.si[i]);vp[i]=make_float2(p.ri[i],p.vi[i]);}
+  return make_float3(interp_cyl(ir,hp,sm),interp_cyl(ir,sp,sm),interp_cyl(ir,vp,sm));
+}
+
+// g2x
+__DEVICE__ float3 g2x(int g,float3 v){
+  if(g==0)return mmul(R0_C0,R0_C1,R0_C2,v);if(g==1)return mmul(R1_C0,R1_C1,R1_C2,v);
+  if(g==2)return mmul(R2_C0,R2_C1,R2_C2,v);if(g==3)return mmul(R3_C0,R3_C1,R3_C2,v);
+  if(g==4)return mmul(R4_C0,R4_C1,R4_C2,v);if(g==5)return mmul(R5_C0,R5_C1,R5_C2,v);
+  if(g==6)return mmul(R6_C0,R6_C1,R6_C2,v);if(g==7)return mmul(R7_C0,R7_C1,R7_C2,v);
+  if(g==8)return mmul(R8_C0,R8_C1,R8_C2,v);if(g==9)return mmul(R9_C0,R9_C1,R9_C2,v);
+  return mmul(R10_C0,R10_C1,R10_C2,v);}
+
+// interp_cyl
+__DEVICE__ float interp_cyl(float ir,float2 cp[7],float sm){
+  float n=0.0f,d=0.0f;for(int i=0;i<7;i++){float w=_expf(sm*_cosf(ir-cp[i].x));n+=w*cp[i].y;d+=w;}return n/d;
+}
+
+// l2o
+__DEVICE__ float3 l2o(float3 c){float3 l=mmul(L_C0,L_C1,L_C2,c);l=make_float3(cbrt_s(l.x),cbrt_s(l.y),cbrt_s(l.z));return mmul(O_C0,O_C1,O_C2,l);}
+
+// lim_tp
+__DEVICE__ tp_t lim_tp(tp_t p){
+  float pos[7];for(int i=0;i<7;i++)pos[i]=p.ri[i]+p.hi[i];
+  if(pos[0]>pos[6])pos[0]-=2.0f*PI;
+  for(int j=0;j<12;j++){
+    int u=0;
+    for(int i=0;i<6;i++){if(pos[i]>pos[i+1]){float m=(pos[i]+pos[i+1])*0.5f;pos[i]=m;pos[i+1]=m;u=1;}}
+    if(pos[6]>pos[0]+2.0f*PI){float m=(pos[6]+pos[0]+2.0f*PI)*0.5f;pos[6]=m;pos[0]=m-2.0f*PI;u=1;}
+    if(!u)break;
+  }
+  for(int i=0;i<7;i++)p.hi[i]=pos[i]-p.ri[i];
+  return p;
+}
+
+// limiter
+__DEVICE__ float limiter(float v,float l){return smootherstep(0.0f,l,v);}
+
+// mk_tp
+__DEVICE__ tp_t mk_tp(float ri[7],float hi[7],float si[7],float vi[7]){
+  tp_t p;for(int i=0;i<7;i++){p.ri[i]=ri[i];p.hi[i]=hi[i];p.si[i]=si[i];p.vi[i]=vi[i];}return p;
+}
+
+// mmul
+__DEVICE__ float3 mmul(float3 c0,float3 c1,float3 c2,float3 v){return make_float3(c0.x*v.x+c1.x*v.y+c2.x*v.z,c0.y*v.x+c1.y*v.y+c2.y*v.z,c0.z*v.x+c1.z*v.y+c2.z*v.z);}
+
+// mod2
+__DEVICE__ float mod2(float x,float y){return x<0.0f?y+_fmod(x,y):_fmod(x,y);}
+
+// o2l
+__DEVICE__ float3 o2l(float3 c){float3 l=mmul(P_C0,P_C1,P_C2,c);l=make_float3(l.x*l.x*l.x,l.y*l.y*l.y,l.z*l.z*l.z);return mmul(Q_C0,Q_C1,Q_C2,l);}
+
+// oklab_to_work
+__DEVICE__ float3 oklab_to_work(float3 lab){float3 srgb=o2l(lab);return x2g(1,mmul(S0_C0,S0_C1,S0_C2,srgb));}
+
+// printer_lights
+__DEVICE__ float3 printer_lights(float3 rgb,float master,float red,float green,float blue){
+  float m=master-25.0f;
+  float rg=_powf(10.0f,(m+red-25.0f)*0.0125f);
+  float gg=_powf(10.0f,(m+green-25.0f)*0.0125f);
+  float bg=_powf(10.0f,(m+blue-25.0f)*0.0125f);
+  return make_float3(rgb.x*rg,rgb.y*gg,rgb.z*bg);
+}
+
+// rgb_sat
+__DEVICE__ float rgb_sat(float3 c){float mn=_fminf(c.x,_fminf(c.y,c.z)),mx=_fmaxf(c.x,_fmaxf(c.y,c.z));return mx==0.0f?0.0f:(mx-mn)/mx;}
+
+// shape_tone_oklab
+__DEVICE__ float shape_tone_oklab(float v,float sh,float hl){
+  const float HINGE=0.70f,KNEE=0.18f,SH_SLOPE=0.35f;
+  // Shadow region weight: 1 at black, fades out by the low-mids.
+  float sw=1.0f-smootherstep(0.0f,0.45f,v);
+  // Lift/deepen anchored at black (multiplicative near-black so v=0 stays 0).
+  v*=1.0f+sh*SH_SLOPE*sw;
+  // Highlight region weight around a soft hinge; open above, close below for compress.
+  float hw=smootherstep(HINGE-KNEE,HINGE+KNEE,v);
+  // Signed soft-knee: hl>0 compresses the gap above HINGE, hl<0 expands it.
+  float gap=v-HINGE;
+  float shp=hl>0.0f?HINGE+gap/(1.0f+hl*2.5f*_fabs(gap)):HINGE+gap*(1.0f-hl*0.5f);
+  v+=(shp-v)*hw;
+  return v;
+}
+
+// smootherstep
+__DEVICE__ float smootherstep(float e0,float e1,float x){x=_fmaxf(e0,_fminf(e1,x));x=(x-e0)/(e1-e0);return x*x*(3.0f-2.0f*x);}
+
+// spowf
+__DEVICE__ float spowf(float x,float p){float y=_powf(_fabs(x),p);return(x<0.0f)?-y:y;}
+
+// tf709d
+__DEVICE__ float3 tf709d(float3 v){float3 o;o.x=v.x<=0.081f?v.x/4.5f:_powf((v.x+0.099f)/1.099f,1.0f/0.45f);o.y=v.y<=0.081f?v.y/4.5f:_powf((v.y+0.099f)/1.099f,1.0f/0.45f);o.z=v.z<=0.081f?v.z/4.5f:_powf((v.z+0.099f)/1.099f,1.0f/0.45f);return o;}
+
+// tf709e
+__DEVICE__ float3 tf709e(float3 v){float3 o;o.x=v.x<=0.018f?4.5f*v.x:1.099f*_powf(v.x,0.45f)-0.099f;o.y=v.y<=0.018f?4.5f*v.y:1.099f*_powf(v.y,0.45f)-0.099f;o.z=v.z<=0.018f?4.5f*v.z:1.099f*_powf(v.z,0.45f)-0.099f;return o;}
+
+// tfapl
+__DEVICE__ float3 tfapl(float3 v){float Pt=APPLE_SIGMA*(APPLE_RT-APPLE_R0)*(APPLE_RT-APPLE_R0);float3 o;o.x=v.x>=Pt?_powf(2.0f,(v.x-APPLE_DELTA)/APPLE_GAMMA)-APPLE_BETA:(v.x>=0.0f?_sqrtf(v.x/APPLE_SIGMA)+APPLE_R0:APPLE_R0);o.y=v.y>=Pt?_powf(2.0f,(v.y-APPLE_DELTA)/APPLE_GAMMA)-APPLE_BETA:(v.y>=0.0f?_sqrtf(v.y/APPLE_SIGMA)+APPLE_R0:APPLE_R0);o.z=v.z>=Pt?_powf(2.0f,(v.z-APPLE_DELTA)/APPLE_GAMMA)-APPLE_BETA:(v.z>=0.0f?_sqrtf(v.z/APPLE_SIGMA)+APPLE_R0:APPLE_R0);return o;}
+
+// tfaple
+__DEVICE__ float3 tfaple(float3 v){float3 o;o.x=v.x<=APPLE_R0?0.0f:v.x<APPLE_RT?APPLE_SIGMA*(v.x-APPLE_R0)*(v.x-APPLE_R0):APPLE_DELTA+APPLE_GAMMA*_log2f(v.x+APPLE_BETA);o.y=v.y<=APPLE_R0?0.0f:v.y<APPLE_RT?APPLE_SIGMA*(v.y-APPLE_R0)*(v.y-APPLE_R0):APPLE_DELTA+APPLE_GAMMA*_log2f(v.y+APPLE_BETA);o.z=v.z<=APPLE_R0?0.0f:v.z<APPLE_RT?APPLE_SIGMA*(v.z-APPLE_R0)*(v.z-APPLE_R0):APPLE_DELTA+APPLE_GAMMA*_log2f(v.z+APPLE_BETA);return o;}
+
+// tfc2d
+__DEVICE__ float3 tfc2d(float3 v){float k=0.092864125f,m=0.24136077f,n=87.09937546f;float3 o;o.x=v.x<k?-(_powf(10.0f,(k-v.x)/m)-1.0f)/n:(_powf(10.0f,(v.x-k)/m)-1.0f)/n;o.y=v.y<k?-(_powf(10.0f,(k-v.y)/m)-1.0f)/n:(_powf(10.0f,(v.y-k)/m)-1.0f)/n;o.z=v.z<k?-(_powf(10.0f,(k-v.z)/m)-1.0f)/n:(_powf(10.0f,(v.z-k)/m)-1.0f)/n;return o*0.9f;}
+
+// tfc2e
+__DEVICE__ float3 tfc2e(float3 v){float k=0.092864125f,m=0.24136077f,n=87.09937546f;v=make_float3(v.x/0.9f,v.y/0.9f,v.z/0.9f);float3 o;o.x=v.x<0.0f?k-m*_log10f(-v.x*n+1.0f):k+m*_log10f(v.x*n+1.0f);o.y=v.y<0.0f?k-m*_log10f(-v.y*n+1.0f):k+m*_log10f(v.y*n+1.0f);o.z=v.z<0.0f?k-m*_log10f(-v.z*n+1.0f):k+m*_log10f(v.z*n+1.0f);return o;}
+
+// tfc3d
+__DEVICE__ float3 tfc3d(float3 v){float3 o;o.x=v.x<0.097465473f?-(_powf(10.0f,(0.12783901f-v.x)/0.36726845f)-1.0f)/14.98325f:(v.x<=0.15277891f?(v.x-0.12512219f)/1.9754798f:(_powf(10.0f,(v.x-0.12240537f)/0.36726845f)-1.0f)/14.98325f);o.y=v.y<0.097465473f?-(_powf(10.0f,(0.12783901f-v.y)/0.36726845f)-1.0f)/14.98325f:(v.y<=0.15277891f?(v.y-0.12512219f)/1.9754798f:(_powf(10.0f,(v.y-0.12240537f)/0.36726845f)-1.0f)/14.98325f);o.z=v.z<0.097465473f?-(_powf(10.0f,(0.12783901f-v.z)/0.36726845f)-1.0f)/14.98325f:(v.z<=0.15277891f?(v.z-0.12512219f)/1.9754798f:(_powf(10.0f,(v.z-0.12240537f)/0.36726845f)-1.0f)/14.98325f);return o*0.9f;}
+
+// tfc3e
+__DEVICE__ float3 tfc3e(float3 v){v=make_float3(v.x/0.9f,v.y/0.9f,v.z/0.9f);float3 o;o.x=v.x<=0.0f?0.12783901f-0.36726845f*_log10f(-v.x*14.98325f+1.0f):v.x<=(0.15277891f-0.12512219f)/1.9754798f?v.x*1.9754798f+0.12512219f:0.12240537f+0.36726845f*_log10f(v.x*14.98325f+1.0f);o.y=v.y<=0.0f?0.12783901f-0.36726845f*_log10f(-v.y*14.98325f+1.0f):v.y<=(0.15277891f-0.12512219f)/1.9754798f?v.y*1.9754798f+0.12512219f:0.12240537f+0.36726845f*_log10f(v.y*14.98325f+1.0f);o.z=v.z<=0.0f?0.12783901f-0.36726845f*_log10f(-v.z*14.98325f+1.0f):v.z<=(0.15277891f-0.12512219f)/1.9754798f?v.z*1.9754798f+0.12512219f:0.12240537f+0.36726845f*_log10f(v.z*14.98325f+1.0f);return o;}
+
+// tfcctd
+__DEVICE__ float3 tfcctd(float3 v){float A=10.5402377417f,B=0.0729055342f,YB=0.15525114f;float3 o;o.x=v.x<=YB?(v.x-B)/A:_powf(2.0f,v.x*17.52f-9.72f);o.y=v.y<=YB?(v.y-B)/A:_powf(2.0f,v.y*17.52f-9.72f);o.z=v.z<=YB?(v.z-B)/A:_powf(2.0f,v.z*17.52f-9.72f);return o;}
+
+// tfccte
+__DEVICE__ float3 tfccte(float3 v){float A=10.5402377417f,B=0.0729055342f,XB=0.0078125f;float3 o;o.x=v.x<=XB?A*v.x+B:(_log2f(v.x)+9.72f)/17.52f;o.y=v.y<=XB?A*v.y+B:(_log2f(v.y)+9.72f)/17.52f;o.z=v.z<=XB?A*v.z+B:(_log2f(v.z)+9.72f)/17.52f;return o;}
+
+// tfd
+__DEVICE__ float3 tfd(float3 r,int t){if(t==0)return tf709d(r);if(t==1)return tfl4d(r);if(t==2)return tfl3d(r);if(t==3)return tfs3d(r);if(t==4)return tfvld(r);if(t==5)return tflg10d(r);if(t==6)return tfdwd(r);if(t==7)return r;if(t==8)return tfc2d(r);if(t==9)return tfc3d(r);if(t==10)return tfdld(r);if(t==11)return r;if(t==12)return r;if(t==13)return tfapl(r);return tfcctd(r);}
+
+// tfdld
+__DEVICE__ float3 tfdld(float3 v){float3 o;o.x=v.x<=0.14f?(v.x-0.0929f)/6.025f:(_powf(10.0f,3.89616f*v.x-2.27752f)-0.0108f)/0.9892f;o.y=v.y<=0.14f?(v.y-0.0929f)/6.025f:(_powf(10.0f,3.89616f*v.y-2.27752f)-0.0108f)/0.9892f;o.z=v.z<=0.14f?(v.z-0.0929f)/6.025f:(_powf(10.0f,3.89616f*v.z-2.27752f)-0.0108f)/0.9892f;return o;}
+
+// tfdle
+__DEVICE__ float3 tfdle(float3 v){float3 o;o.x=v.x<=(0.14f-0.0929f)/6.025f?v.x*6.025f+0.0929f:(_log10f(v.x*0.9892f+0.0108f)+2.27752f)/3.89616f;o.y=v.y<=(0.14f-0.0929f)/6.025f?v.y*6.025f+0.0929f:(_log10f(v.y*0.9892f+0.0108f)+2.27752f)/3.89616f;o.z=v.z<=(0.14f-0.0929f)/6.025f?v.z*6.025f+0.0929f:(_log10f(v.z*0.9892f+0.0108f)+2.27752f)/3.89616f;return o;}
+
+// tfdwd
+__DEVICE__ float3 tfdwd(float3 v){float A=0.0075f,B=7.0f,C=0.07329248f,LC=0.02740668f,M=10.44426855f;float3 o;o.x=v.x<=LC?v.x/M:_powf(2.0f,(v.x/C)-B)-A;o.y=v.y<=LC?v.y/M:_powf(2.0f,(v.y/C)-B)-A;o.z=v.z<=LC?v.z/M:_powf(2.0f,(v.z/C)-B)-A;return o;}
+
+// tfdwe
+__DEVICE__ float3 tfdwe(float3 v){float A=0.0075f,B=7.0f,C=0.07329248f,LC=0.02740668f,M=10.44426855f;float3 o;o.x=v.x<=LC/M?v.x*M:C*(_log2f(v.x+A)+B);o.y=v.y<=LC/M?v.y*M:C*(_log2f(v.y+A)+B);o.z=v.z<=LC/M?v.z*M:C*(_log2f(v.z+A)+B);return o;}
+
+// tfe
+__DEVICE__ float3 tfe(float3 r,int t){if(t==0)return tf709e(r);if(t==1)return tfl4e(r);if(t==2)return tfl3e(r);if(t==3)return tfs3e(r);if(t==4)return tfvle(r);if(t==5)return tflg10e(r);if(t==6)return tfdwe(r);if(t==7)return r;if(t==8)return tfc2e(r);if(t==9)return tfc3e(r);if(t==10)return tfdle(r);if(t==11)return r;if(t==12)return r;if(t==13)return tfaple(r);return tfccte(r);}
+
+// tfl3d
+__DEVICE__ float3 tfl3d(float3 v){float cv=LOGC3_E*LOGC3_CUT+LOGC3_F;float3 o;o.x=v.x>cv?(_powf(10.0f,(v.x-LOGC3_D)/LOGC3_C)-LOGC3_B)/LOGC3_A:(v.x-LOGC3_F)/LOGC3_E;o.y=v.y>cv?(_powf(10.0f,(v.y-LOGC3_D)/LOGC3_C)-LOGC3_B)/LOGC3_A:(v.y-LOGC3_F)/LOGC3_E;o.z=v.z>cv?(_powf(10.0f,(v.z-LOGC3_D)/LOGC3_C)-LOGC3_B)/LOGC3_A:(v.z-LOGC3_F)/LOGC3_E;return o;}
+
+// tfl3e
+__DEVICE__ float3 tfl3e(float3 v){float3 o;o.x=v.x>LOGC3_CUT?LOGC3_C*_log10f(LOGC3_A*v.x+LOGC3_B)+LOGC3_D:LOGC3_E*v.x+LOGC3_F;o.y=v.y>LOGC3_CUT?LOGC3_C*_log10f(LOGC3_A*v.y+LOGC3_B)+LOGC3_D:LOGC3_E*v.y+LOGC3_F;o.z=v.z>LOGC3_CUT?LOGC3_C*_log10f(LOGC3_A*v.z+LOGC3_B)+LOGC3_D:LOGC3_E*v.z+LOGC3_F;return o;}
+
+// tfl4d
+__DEVICE__ float3 tfl4d(float3 v){float a=LOGC4_A,b=LOGC4_B,c=LOGC4_C,s2=LOGC4_S2,t=LOGC4_T;float3 o;o.x=v.x>=0.0f?(_powf(2.0f,14.0f*((v.x-c)/b)+6.0f)-64.0f)/a:v.x*s2+t;o.y=v.y>=0.0f?(_powf(2.0f,14.0f*((v.y-c)/b)+6.0f)-64.0f)/a:v.y*s2+t;o.z=v.z>=0.0f?(_powf(2.0f,14.0f*((v.z-c)/b)+6.0f)-64.0f)/a:v.z*s2+t;return o;}
+
+// tfl4e
+__DEVICE__ float3 tfl4e(float3 v){float a=LOGC4_A,b=LOGC4_B,c=LOGC4_C,s2=LOGC4_S2,t=LOGC4_T;float3 o;o.x=v.x>t?c+b*(_log10f(a*v.x+64.0f)/_log10f(2.0f)-6.0f)/14.0f:(v.x-t)/s2;o.y=v.y>t?c+b*(_log10f(a*v.y+64.0f)/_log10f(2.0f)-6.0f)/14.0f:(v.y-t)/s2;o.z=v.z>t?c+b*(_log10f(a*v.z+64.0f)/_log10f(2.0f)-6.0f)/14.0f:(v.z-t)/s2;return o;}
+
+// tflg10d
+__DEVICE__ float3 tflg10d(float3 v){float B=25.0f*(_sqrtf(4093.0f)-3.0f)/9.0f,A=1.0f/_log10f(B*184.32f+1.0f);return make_float3(v.x<0.0f?v.x/(A*B*0.4342944819f):(_powf(10.0f,v.x/A)-1.0f)/B,v.y<0.0f?v.y/(A*B*0.4342944819f):(_powf(10.0f,v.y/A)-1.0f)/B,v.z<0.0f?v.z/(A*B*0.4342944819f):(_powf(10.0f,v.z/A)-1.0f)/B);}
+
+// tflg10e
+__DEVICE__ float3 tflg10e(float3 v){float B=25.0f*(_sqrtf(4093.0f)-3.0f)/9.0f,A=1.0f/_log10f(B*184.32f+1.0f);return make_float3(v.x<0.0f?v.x*(A*B*0.4342944819f):A*_log10f(v.x*B+1.0f),v.y<0.0f?v.y*(A*B*0.4342944819f):A*_log10f(v.y*B+1.0f),v.z<0.0f?v.z*(A*B*0.4342944819f):A*_log10f(v.z*B+1.0f));}
+
+// tfs3d
+__DEVICE__ float3 tfs3d(float3 v){float3 o;o.x=v.x>=171.2102946929f/1023.0f?(_powf(10.0f,(v.x*1023.0f-420.0f)/261.5f))*0.19f-0.01f:(v.x*1023.0f-95.0f)*0.01125f/(171.2102946929f-95.0f);o.y=v.y>=171.2102946929f/1023.0f?(_powf(10.0f,(v.y*1023.0f-420.0f)/261.5f))*0.19f-0.01f:(v.y*1023.0f-95.0f)*0.01125f/(171.2102946929f-95.0f);o.z=v.z>=171.2102946929f/1023.0f?(_powf(10.0f,(v.z*1023.0f-420.0f)/261.5f))*0.19f-0.01f:(v.z*1023.0f-95.0f)*0.01125f/(171.2102946929f-95.0f);return o;}
+
+// tfs3e
+__DEVICE__ float3 tfs3e(float3 v){float a=0.19f,b=0.01f,c=261.5f,d=420.0f,e=171.2102946929f,f=1023.0f;float3 o;o.x=v.x<=0.01125f?(v.x*(e-95.0f)/0.01125f+95.0f)/f:(_log10f((v.x+b)/a)*c+d)/f;o.y=v.y<=0.01125f?(v.y*(e-95.0f)/0.01125f+95.0f)/f:(_log10f((v.y+b)/a)*c+d)/f;o.z=v.z<=0.01125f?(v.z*(e-95.0f)/0.01125f+95.0f)/f:(_log10f((v.z+b)/a)*c+d)/f;return o;}
+
+// tfvld
+__DEVICE__ float3 tfvld(float3 v){float cut=0.181f,b=0.00873f,c=0.241514f,d=0.598206f;float3 o;o.x=v.x<cut?(v.x-0.125f)/5.6f:_powf(10.0f,(v.x-d)/c)-b;o.y=v.y<cut?(v.y-0.125f)/5.6f:_powf(10.0f,(v.y-d)/c)-b;o.z=v.z<cut?(v.z-0.125f)/5.6f:_powf(10.0f,(v.z-d)/c)-b;return o;}
+
+// tfvle
+__DEVICE__ float3 tfvle(float3 v){float cut=0.181f,b=0.00873f,c=0.241514f,d=0.598206f;float3 o;o.x=v.x<=(cut-0.125f)/5.6f?v.x*5.6f+0.125f:c*_log10f(v.x+b)+d;o.y=v.y<=(cut-0.125f)/5.6f?v.y*5.6f+0.125f:c*_log10f(v.y+b)+d;o.z=v.z<=(cut-0.125f)/5.6f?v.z*5.6f+0.125f:c*_log10f(v.z+b)+d;return o;}
+
+// transform
+__DEVICE__ float3 transform(int p_Width,int p_Height,int p_X,int p_Y,float p_R,float p_G,float p_B){
+  // Clamp all parameters to safe ranges (keyframes can bypass slider limits).
+  // Ranges mirror the DEFINE_UI_PARAMS UI bounds.
+  float c_temp=clampf(temp,-2.0f,2.0f), c_tint=clampf(tint,-1.5f,1.5f);
+  float c_lift=clampf(lift,-0.5f,0.5f);
+  float c_gamma=clampf(gamma,0.2f,3.0f), c_gain=clampf(gain,0.0f,4.0f), c_contrast=clampf(contrast,0.5f,1.5f);
+  float c_shadows=clampf(shadows,-1.0f,1.0f), c_highlights=clampf(highlights,-1.0f,1.0f);
+  float c_exp=clampf(exp_global,-5.0f,5.0f), c_flash=clampf(exp_flash,-2.0f,2.0f);
+  float c_sat=clampf(sat_amount,0.0f,3.0f), c_hue=clampf(hue,-180.0f,180.0f);
+  float c_satcomp=clampf(sat_compression,0.0f,1.0f);
+  float c_desat_hi=clampf(desat_high,0.0f,1.0f), c_mid=clampf(mid_detail,0.0f,1.0f);
+  float c_skinH=clampf(skin_hue,-45.0f,45.0f), c_skinS=clampf(skin_sat,0.0f,2.0f);
+  float c_skinV=clampf(skin_val,-0.5f,0.5f), c_skinE=clampf(skin_evenness,0.0f,1.0f);
+  float c_gsat=clampf(global_sat,-1.0f,1.0f);
+  float c_limsat=clampf(lim_sat,0.0f,1.0f), c_limdens=clampf(lim_dens,0.0f,1.0f);
+  float c_rd=clampf(r_dens,0.0f,1.0f), c_yd=clampf(y_dens,0.0f,1.0f), c_gd=clampf(g_dens,0.0f,1.0f);
+  float c_cd=clampf(c_dens,0.0f,1.0f), c_bd=clampf(b_dens,0.0f,1.0f), c_md=clampf(m_dens,0.0f,1.0f);
+  float c_plm=clampf(pl_master,0.0f,50.0f), c_plr=clampf(pl_red,0.0f,50.0f), c_plg=clampf(pl_green,0.0f,50.0f), c_plb=clampf(pl_blue,0.0f,50.0f);
+
+  int g=_fminf(_fmaxf((int)(in_gamut+0.5f),0),10);
+  int ti_tf=_fminf(_fmaxf((int)(in_transfer+0.5f),0),14);
+  float3 r=make_float3(p_R,p_G,p_B);
+
+  // Forward: native decode -> XYZ D65 -> CAT16 white balance -> linear AWG4.
+  float3 lin=tfd(r,ti_tf);
+  float3 xyz=g2x(g,lin);
+  if(g==8)xyz=d60_to_d65(xyz);
+  xyz=white_balance(xyz,c_temp,c_tint);
+  float3 work=x2g(1,xyz);
+  work=printer_lights(work,c_plm,c_plr,c_plg,c_plb);
+  // Scene-linear exposure -> flash -> master gain, all before the OKLab grade.
+  work*=make_float3(_powf(2.0f,c_exp),_powf(2.0f,c_exp),_powf(2.0f,c_exp));
+  work.x+=c_flash*EXPO_FLASH_SCALE;work.y+=c_flash*EXPO_FLASH_SCALE;work.z+=c_flash*EXPO_FLASH_SCALE;
+  work*=make_float3(c_gain,c_gain,c_gain);
+
+  // Grade in OKLab
+  float3 lab=work_to_oklab(work);
+  float L=lab.x;
+
+  // Global OKLab saturation/hue
+  float av=lab.y*c_sat,bv=lab.z*c_sat;
+  float ang=c_hue*3.14159265359f/180.0f,ca=_cosf(ang),sak=_sinf(ang);
+  lab.y=av*ca-bv*sak;lab.z=av*sak+bv*ca;
+  lab=compress_oklab_chroma(lab,c_satcomp);
+
+  // Tonal: lift (shadow-biased), gamma, contrast S-curve, all on perceptual OKLab L.
+  const float OKLAB_MIDGRAY=0.565f;
+  float liftMask=1.0f-smootherstep(0.0f,0.7f,L);
+  L+=c_lift*liftMask;L=spowf(L,1.0f/c_gamma);
+  // Pivot-centered contrast: L = pivot * (L/pivot)^e. e>1 pushes both halves away from
+  // middle gray (more contrast); e<1 pulls toward it. No fixed point at L=1, so extended
+  // highlights keep spreading rather than collapsing back. spowf keeps signed values.
+  if(_fabs(c_contrast-1.0f)>1e-4f){
+    float pivot=OKLAB_MIDGRAY;
+    L=pivot*spowf(L/pivot,c_contrast);
+  }
+  L=shape_tone_oklab(L,c_shadows,c_highlights);  lab.x=L;
+
+  // Desat highlights: amount = max chroma reduction. fades in ~L 0.80->1.15.
+  if(c_desat_hi>0.001f){
+    float hiW=smootherstep(0.80f,1.15f,L);
+    float cs=1.0f-c_desat_hi*hiW;
+    lab.y*=cs;lab.z*=cs;
+  }
+
+  // Mid Chroma: boost OKLab chroma in a smooth midtone lightness band.
+  if(c_mid>0.001f){
+    float mdMask=smootherstep(0.2f,0.4f,L)*(1.0f-smootherstep(0.6f,0.8f,L));
+    float md=1.0f+c_mid*mdMask*0.3f;
+    lab.y*=md;lab.z*=md;
+  }
+
+  // Skin/warm axis (tetra, from thatcherfreeman/SmoothTetraSkin) in OKLab a/b hue space.
+  // Broad lightness weighting so very dark/bright objects are less affected.
+  // Skin/warm lightness gate: dark fades in->full mids->fades out bright.
+  float sk_dg=smootherstep(0.02f,0.18f,L),sk_bg=1.0f-smootherstep(1.0f,1.5f,L);
+  float sk_lw=sk_dg*sk_bg;
+  float sk_ri[7]={0.5102284f,1.0685f,1.9158353f,2.4870127f,3.3993594f,4.6085770f,5.7310226f};
+  float sk_hi[7]={0.0f,deg_to_rad(c_skinH),0.0f,0.0f,0.0f,0.0f,0.0f};
+  float sk_si[7]={1.0f,c_skinS,1.0f,1.0f,1.0f,1.0f,1.0f};
+  float sk_vi[7]={0.0f,c_skinV,0.0f,0.0f,0.0f,0.0f,0.0f};
+  tp_t sk_p=mk_tp(sk_ri,sk_hi,sk_si,sk_vi);sk_p=lim_tp(sk_p);
+  float sk_c=_sqrtf(lab.y*lab.y+lab.z*lab.z);
+  float sk_h=sk_c>0.0f?mod2(_atan2f(lab.z,lab.y),2.0f*PI):0.0f;
+  float3 sk_adj=ev_curves(sk_h,sk_p,5.0f);
+  float3 lab_skin=make_float3(lab.x+sk_adj.z,(sk_c*sk_adj.y)*_cosf(sk_h+sk_adj.x),(sk_c*sk_adj.y)*_sinf(sk_h+sk_adj.x));
+  float sk_nm=smootherstep(0.0f,0.1f,sk_c)*sk_lw;
+  lab=lab+(lab_skin-lab)*sk_nm;
+  if(c_skinE>0.0f){
+    float sk_ec=_sqrtf(lab.y*lab.y+lab.z*lab.z);
+    float sk_eh=sk_ec>0.0f?mod2(_atan2f(lab.z,lab.y),2.0f*PI):0.0f;
+    float sk_ealign=_cosf(sk_eh-1.0685f);
+    float sk_emask=smootherstep(0.70f,0.95f,sk_ealign)*smootherstep(0.015f,0.080f,sk_ec)*sk_lw;
+    if(sk_emask>0.0f){
+      float sk_edelta=_atan2f(_sinf(1.0685f-sk_eh),_cosf(1.0685f-sk_eh));
+      float sk_eout=sk_eh+sk_edelta*c_skinE*sk_emask;
+      lab.y=sk_ec*_cosf(sk_eout);lab.z=sk_ec*_sinf(sk_eout);
+    }
+  }
+
+  float3 out=oklab_to_work(lab);
+
+  // Density: subtractive sat + per-hue density (MONONODES-style), applied in linear AWG4.
+  float d_asat = (c_limsat>0.0f)?limiter(rgb_sat(out),c_limsat):1.0f;
+  float d_aden = (c_limdens>0.0f)?limiter(rgb_sat(out),c_limdens):1.0f;
+  float d_rd=-(c_rd*d_aden); float d_gd=-(c_gd*d_aden); float d_bd=-(c_bd*d_aden);
+  float d_cd=-(c_cd*d_aden*0.5f); float d_md=-(c_md*d_aden*0.5f); float d_yd=-(c_yd*d_aden*0.5f);
+  float d_gs=c_gsat*d_asat;
+  float3 d_blk = make_float3(0.0f,0.0f,0.0f);
+  float3 d_wht = make_float3(1.0f,1.0f,1.0f);
+  float3 d_rv = make_float3(d_rd+1.0f,d_rd-d_gs,d_rd-d_gs);
+  float3 d_gv = make_float3(d_gd-d_gs,d_gd+1.0f,d_gd-d_gs);
+  float3 d_bv = make_float3(d_bd-d_gs,d_bd-d_gs,d_bd+1.0f);
+  float3 d_cv = make_float3(d_cd-d_gs,d_cd+1.0f,d_cd+1.0f);
+  float3 d_mv = make_float3(d_md+1.0f,d_md-d_gs,d_md+1.0f);
+  float3 d_yv = make_float3(d_yd+1.0f,d_yd+1.0f,d_yd-d_gs);
+  float d_Rv=out.x; float d_Gv=out.y; float d_Bv=out.z;
+  float3 d_nrgb;
+  float d_r1x=d_rv.x-d_blk.x,d_r1y=d_rv.y-d_blk.y,d_r1z=d_rv.z-d_blk.z;
+  if(d_Rv>d_Gv){
+    if(d_Gv>d_Bv){
+      float d_y2x=d_yv.x-d_rv.x,d_y2y=d_yv.y-d_rv.y,d_y2z=d_yv.z-d_rv.z;
+      float d_w3x=d_wht.x-d_yv.x,d_w3y=d_wht.y-d_yv.y,d_w3z=d_wht.z-d_yv.z;
+      d_nrgb=make_float3(d_Rv*d_r1x+d_blk.x+d_Gv*d_y2x+d_Bv*d_w3x,d_Rv*d_r1y+d_blk.y+d_Gv*d_y2y+d_Bv*d_w3y,d_Rv*d_r1z+d_blk.z+d_Gv*d_y2z+d_Bv*d_w3z);
+    }else if(d_Rv>d_Bv){
+      float d_w2x=d_wht.x-d_mv.x,d_w2y=d_wht.y-d_mv.y,d_w2z=d_wht.z-d_mv.z;
+      float d_m3x=d_mv.x-d_rv.x,d_m3y=d_mv.y-d_rv.y,d_m3z=d_mv.z-d_rv.z;
+      d_nrgb=make_float3(d_Rv*d_r1x+d_blk.x+d_Gv*d_w2x+d_Bv*d_m3x,d_Rv*d_r1y+d_blk.y+d_Gv*d_w2y+d_Bv*d_m3y,d_Rv*d_r1z+d_blk.z+d_Gv*d_w2z+d_Bv*d_m3z);
+    }else{
+      float d_m4x=d_mv.x-d_bv.x,d_m4y=d_mv.y-d_bv.y,d_m4z=d_mv.z-d_bv.z;
+      float d_w5x=d_wht.x-d_mv.x,d_w5y=d_wht.y-d_mv.y,d_w5z=d_wht.z-d_mv.z;
+      float d_b6x=d_bv.x-d_blk.x,d_b6y=d_bv.y-d_blk.y,d_b6z=d_bv.z-d_blk.z;
+      d_nrgb=make_float3(d_Rv*d_m4x+d_Gv*d_w5x+d_Bv*d_b6x+d_blk.x,d_Rv*d_m4y+d_Gv*d_w5y+d_Bv*d_b6y+d_blk.y,d_Rv*d_m4z+d_Gv*d_w5z+d_Bv*d_b6z+d_blk.z);
+    }
+  }else{
+    float d_w7x=d_wht.x-d_cv.x,d_w7y=d_wht.y-d_cv.y,d_w7z=d_wht.z-d_cv.z;
+    float d_c8x=d_cv.x-d_bv.x,d_c8y=d_cv.y-d_bv.y,d_c8z=d_cv.z-d_bv.z;
+    float d_b9x=d_bv.x-d_blk.x,d_b9y=d_bv.y-d_blk.y,d_b9z=d_bv.z-d_blk.z;
+    if(d_Bv>d_Gv)d_nrgb=make_float3(d_Rv*d_w7x+d_Gv*d_c8x+d_Bv*d_b9x+d_blk.x,d_Rv*d_w7y+d_Gv*d_c8y+d_Bv*d_b9y+d_blk.y,d_Rv*d_w7z+d_Gv*d_c8z+d_Bv*d_b9z+d_blk.z);
+    else if(d_Bv>d_Rv){
+      float d_gAx=d_gv.x-d_blk.x,d_gAy=d_gv.y-d_blk.y,d_gAz=d_gv.z-d_blk.z;
+      float d_cBx=d_cv.x-d_gv.x,d_cBy=d_cv.y-d_gv.y,d_cBz=d_cv.z-d_gv.z;
+      d_nrgb=make_float3(d_Rv*d_w7x+d_Gv*d_gAx+d_blk.x+d_Bv*d_cBx,d_Rv*d_w7y+d_Gv*d_gAy+d_blk.y+d_Bv*d_cBy,d_Rv*d_w7z+d_Gv*d_gAz+d_blk.z+d_Bv*d_cBz);
+    }else{
+      float d_yCx=d_yv.x-d_gv.x,d_yCy=d_yv.y-d_gv.y,d_yCz=d_yv.z-d_gv.z;
+      float d_gDx=d_gv.x-d_blk.x,d_gDy=d_gv.y-d_blk.y,d_gDz=d_gv.z-d_blk.z;
+      float d_wEx=d_wht.x-d_yv.x,d_wEy=d_wht.y-d_yv.y,d_wEz=d_wht.z-d_yv.z;
+      d_nrgb=make_float3(d_Rv*d_yCx+d_Gv*d_gDx+d_blk.x+d_Bv*d_wEx,d_Rv*d_yCy+d_Gv*d_gDy+d_blk.y+d_Bv*d_wEy,d_Rv*d_yCz+d_Gv*d_gDz+d_blk.z+d_Bv*d_wEz);
+    }
+  }
+  out=d_nrgb;
+
+  // Reverse: linear AWG4 -> destination XYZ/gamut -> native transfer.
+  float3 rxyz=g2x(1,out);
+  if(g==8)rxyz=d65_to_d60(rxyz);
+  float3 cam=x2g(g,rxyz);
+  cam=compress_to_gamut(cam,rxyz.y);
+  float3 result=tfe(cam,ti_tf);
+
+  // Preserve finite extended values; only replace NaN/Inf.
+  float nx=(result.x==result.x&&_fabs(result.x)<3.402823e38f)?result.x:0.0f;
+  float ny=(result.y==result.y&&_fabs(result.y)<3.402823e38f)?result.y:0.0f;
+  float nz=(result.z==result.z&&_fabs(result.z)<3.402823e38f)?result.z:0.0f;
+  return make_float3(nx,ny,nz);
+}
+
+// white_balance
+__DEVICE__ float3 white_balance(float3 xyz,float temp_value,float tint_value){
+  if(_fabs(temp_value)<1e-6f&&_fabs(tint_value)<1e-6f)return xyz;
+  float k=6504.0f*_expf(temp_value*1.0f),k2=k*k,k3=k2*k;
+  float x=k<=4000.0f?-0.2661239e9f/k3-0.2343580e6f/k2+0.8776956e3f/k+0.179910f:-3.0258469e9f/k3+2.1070379e6f/k2+0.2226347e3f/k+0.240390f;
+  float y=k<=4000.0f?-1.1063814f*x*x*x-1.34811020f*x*x+2.18555832f*x-0.20219683f:3.0817580f*x*x*x-5.8733867f*x*x+3.75112997f*x-0.37001483f;
+  y=_fmaxf(y+tint_value*0.025f,0.05f);
+  float3 source_white=make_float3(x/y,1.0f,(1.0f-x-y)/y);
+  return cat16_adapt(xyz,source_white,WHITE_D65);
+}
+
+// work_to_oklab
+__DEVICE__ float3 work_to_oklab(float3 work){float3 xyz=g2x(1,work);return l2o(mmul(I0_C0,I0_C1,I0_C2,xyz));}
+
+// x2g
+__DEVICE__ float3 x2g(int g,float3 v){
+  if(g==0)return mmul(G0_C0,G0_C1,G0_C2,v);if(g==1)return mmul(G1_C0,G1_C1,G1_C2,v);
+  if(g==2)return mmul(G2_C0,G2_C1,G2_C2,v);if(g==3)return mmul(G3_C0,G3_C1,G3_C2,v);
+  if(g==4)return mmul(G4_C0,G4_C1,G4_C2,v);if(g==5)return mmul(G5_C0,G5_C1,G5_C2,v);
+  if(g==6)return mmul(G6_C0,G6_C1,G6_C2,v);if(g==7)return mmul(G7_C0,G7_C1,G7_C2,v);
+  if(g==8)return mmul(G8_C0,G8_C1,G8_C2,v);if(g==9)return mmul(G9_C0,G9_C1,G9_C2,v);
+  return mmul(G10_C0,G10_C1,G10_C2,v);}
+
